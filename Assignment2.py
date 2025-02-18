@@ -45,54 +45,23 @@ for i in range(n_cuda_devices):
 
 batch_size = 32
 image_resize = 224
-num_workers = 4
-num_epochs = 10
-max_len = 24
+num_workers = 8
+num_epochs =10
+max_len = 36
 best_loss = 1e+10
 learning_rate = 2e-5
 stats = (torch.tensor([0.4482, 0.4192, 0.3900]), torch.tensor([0.2918, 0.2796, 0.2709]))
 
-# Function to get thge statistics of a dataset
-def get_dataset_stats(data_loader):
-    mean = torch.zeros(3)
-    std = torch.zeros(3)
-    nb_samples = 0.
-    for data in data_loader:
-        data = data[0] # Get the images to compute the statistics
-        batch_samples = data.size(0)
-        data = data.view(batch_samples, data.size(1), -1)
-        mean += data.mean(2).sum(0)
-        std += data.std(2).sum(0)
-        nb_samples += batch_samples
-    mean /= nb_samples
-    std /= nb_samples
-    return mean,std
-
 # Modify the imshow function to ensure stats are on the same device as the image
 def imshow(img, stats):
-    mean = stats[0].view(3, 1, 1).to(img.device)  # Move mean to the same device as img
-    std = stats[1].view(3, 1, 1).to(img.device)   # Move std to the same device as img
+    mean = stats[0].view(3, 1, 1).to(img.device)
+    std = stats[1].view(3, 1, 1).to(img.device)
     img = img * std + mean
-    npimg = img.cpu().numpy()  # Convert the tensor back to numpy after moving it to CPU
+    npimg = img.cpu().numpy()
     plt.imshow(np.transpose(npimg, (1, 2, 0)))
     plt.show()
 
-# Test function
-def test_model(model, dataloader):
-    model.load_state_dict(torch.load("best_model.pth"))
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-            correct += torch.sum(preds == labels).item()
-            total += labels.size(0)
-    print(f"Test Accuracy: {100 * correct / total:.2f}%")
-
-# Define the model
+# Define the text model
 class DistilBERTClassifier(nn.Module):
     def __init__(self, num_classes):
         super(DistilBERTClassifier, self).__init__()
@@ -123,38 +92,6 @@ def read_text_files_with_labels(path):
                     texts.append(text_without_digits)
                     labels.append(label_map[class_name])
     return np.array(texts), np.array(labels)
-
-# Define your dataset class
-class CustomDataset(Dataset):
-    def __init__(self, image_dataset, tokenizer, max_len):
-        self.image_dataset = image_dataset
-        self.class_names = image_dataset.classes
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-        #self.label_to_class_map = {i: self.class_names[i] for i in range(len(self.class_names))}
-    def __len__(self):
-        return len(self.image_dataset)
-    def __getitem__(self, idx):
-        image, label = self.image_dataset[idx]
-        image_path = self.image_dataset.samples[idx][0]
-        text = os.path.splitext(os.path.basename(image_path))[0]
-        text = re.sub(r'\d+', '', text).replace('_', ' ')
-        #label = self.label_to_class_map[label]
-        encoding = self.tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=self.max_len,
-            return_token_type_ids=False,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt'
-        )
-        return {
-            'text': text,
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'label': torch.tensor(label, dtype=torch.long)}
 
 # Define training function
 def train(model, dataloader, optimizer, criterion, device):
@@ -200,13 +137,11 @@ def predict(model, dataloader, device):
     with torch.no_grad():  # Disable gradient tracking
         for batch in dataloader:
             images = batch['image'].to(device)
-            input_ids = batch['input_ids'].to(device)  # Assuming input_ids are in the batch
-            attention_mask = batch['attention_mask'].to(device)  # Assuming attention_mask is in the batch
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
             # Forward pass
             outputs = model(images, input_ids, attention_mask)
-            # Get predictions
             _, preds = torch.max(outputs, dim=1)
-            # Convert predictions to CPU and append to the list
             predictions.extend(preds.cpu().numpy())
     return predictions
 
@@ -216,22 +151,19 @@ class MultiInputModel(nn.Module):
         # Image model
         self.image_model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
         num_features = self.image_model.classifier[1].in_features
-        self.image_model.classifier[1] = nn.Identity()  # Removing final classifier
+        self.image_model.classifier[1] = nn.Identity()
         for param in self.image_model.parameters():
-            param.requires_grad = True  # Fine-tune the image model
+            param.requires_grad = True
         # Text model
         self.text_model = DistilBertModel.from_pretrained('distilbert-base-uncased')
-        self.text_fc = nn.Linear(self.text_model.config.hidden_size, 512)  # Reducing output size
+        self.text_fc = nn.Linear(self.text_model.config.hidden_size, 512)
         for param in self.text_model.parameters():
-            param.requires_grad = True  # Fine-tune the text model
+            param.requires_grad = True 
         # Combining both image and text features
-        self.fc1 = nn.Linear(num_features + 512, 512)  # Merging both feature vectors
-        self.fc2 = nn.Linear(512, 256)  # Reduced size
-        self.fc3 = nn.Linear(256, 64)  # Reduced size
-        self.fc4 = nn.Linear(64, num_classes)  # Output layer
-        self.batch_norm1 = nn.BatchNorm1d(512)  # Batch Normalization after fc1
-        self.batch_norm2 = nn.BatchNorm1d(256)  # Batch Normalization after fc2
-        self.batch_norm3 = nn.BatchNorm1d(64)  # Batch Normalization after fc3
+        self.fc1 = nn.Linear(num_features + 512, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 64) 
+        self.fc4 = nn.Linear(64, num_classes)
         self.dropout = nn.Dropout(0.3)
         
     def forward(self, image, input_ids, attention_mask):
@@ -241,23 +173,20 @@ class MultiInputModel(nn.Module):
         # Text features
         text_features = self.text_model(input_ids=input_ids, attention_mask=attention_mask)[0]
         text_features = text_features[:, 0, :]  # Use [CLS] token for classification
-        text_features = self.text_fc(text_features)  # Reduce the dimension
+        text_features = self.text_fc(text_features)
         # Combine image and text features
         combined_features = torch.cat((image_features, text_features), dim=1)
-        # Classifier with Batch Normalization, Activation functions, and Dropout
+        # Classifier with Activation functions, and Dropout
         x = self.fc1(combined_features)
-        x = self.batch_norm1(x)  # Batch Normalization after fc1
-        x = F.relu(x)  # ReLU activation after batch normalization
+        x = F.relu(x)
         x = self.dropout(x)
         x = self.fc2(x)
-        x = self.batch_norm2(x)  # Batch Normalization after fc2
-        x = F.relu(x)  # ReLU activation after batch normalization
+        x = F.relu(x)
         x = self.dropout(x)
         x = self.fc3(x)
-        x = self.batch_norm3(x)  # Batch Normalization after fc2
-        x = F.relu(x)  # ReLU activation after batch normalization
+        x = F.relu(x)
         x = self.dropout(x)
-        x = self.fc4(x)  # No activation for final output layer
+        x = self.fc4(x)
         return x
 
 class MultiModalDataset(Dataset):
@@ -271,8 +200,6 @@ class MultiModalDataset(Dataset):
         return len(self.image_dataset)
     def __getitem__(self, idx):
         image, label = self.image_dataset[idx]
-        # image = torch.clamp(image, 0, 1)
-        # imshow(image, stats)
         label = self.labels[idx]
         text = str(self.texts[idx])
         encoding = self.tokenizer.encode_plus(
@@ -297,8 +224,6 @@ transform = {
         transforms.Resize((232, 232), interpolation=InterpolationMode.BILINEAR),
         transforms.RandomCrop(image_resize),
         transforms.Resize((image_resize, image_resize)),
-        transforms.RandomRotation(30),
-        transforms.RandomAffine(0.01),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
@@ -347,16 +272,11 @@ print("Train set:", len(dataloaders['train'])*batch_size)
 print("Val set:", len(dataloaders['val'])*batch_size)
 print("Test set:", len(dataloaders['test'])*batch_size)
 
-# # Comopute the statistics of the train set
-# stats = get_dataset_stats(train_loader)
-# print("Train stats:", stats)
-
 model = MultiInputModel(num_classes=len(class_names)).to(device)
 
 # Training parameters
 optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
 criterion = nn.CrossEntropyLoss()
-
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
 # Training loop
@@ -368,12 +288,22 @@ for epoch in range(num_epochs):
     if val_loss < best_loss:
         best_loss = val_loss
         torch.save(model.state_dict(), 'best_model.pth')
-    # Step the scheduler after each epoch
+        print("The model has been saved.")
     scheduler.step()
-    print(f'Learning Rate: {scheduler.get_last_lr()[0]:.8f}')
+    # print(f'Learning Rate: {scheduler.get_last_lr()[0]:.8f}')
     
 model.load_state_dict(torch.load('best_model.pth'))
-# labels_test = np.array(list(map(lambda x: x['label'].item(), datasets['test'])))
 # Evaluation
 test_predictions = np.array(predict(model, dataloaders['test'], device))
 print(f"Accuracy: {(test_predictions == labels_test).sum()/len(labels_test):.4f}")
+
+cm = confusion_matrix(labels_test, test_predictions)
+
+# Plot confusion matrix
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, cmap='Blues', fmt='g', cbar=False)
+
+plt.title('Confusion Matrix')
+plt.xlabel('Predicted Labels')
+plt.ylabel('True Labels')
+plt.show()
