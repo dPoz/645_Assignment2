@@ -9,7 +9,12 @@ from torch.utils.data import DataLoader, Dataset
 
 import sys
 sys.path.append('/home/poz/Notebooks/645_Assignment2')
-# from customScript import customScript
+# from myDefsnClasses import imshow, DistilBERTClassifier, read_text_files_with_labels, train, evaluate, predict, MultiInputModel, MultiModalDataset, fullTrain
+
+# import multiprocessing
+# if __name__ == "__main__":
+#     multiprocessing.set_start_method("fork")
+#     torch.multiprocessing.set_sharing_strategy('file_system')
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,14 +26,16 @@ from PIL import ImageOps, Image
 from tqdm import tqdm
 from sklearn.metrics import confusion_matrix
 import seaborn as sns
+from datetime import datetime
 
 import torch.optim as optim
 from torch.optim.lr_scheduler import ExponentialLR
 
 import re
 import os
-os.environ['CUDA_LAUNCH_BLOCKING']="1"
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 os.environ['TORCH_USE_CUDA_DSA'] = "1"
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = "0"
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
@@ -46,8 +53,8 @@ for i in range(n_cuda_devices):
 batch_size = 32
 image_resize = 224
 num_workers = 8
-num_epochs =10
-max_len = 36
+num_epochs = 6
+max_len = 48
 best_loss = 1e+10
 learning_rate = 2e-5
 stats = (torch.tensor([0.4482, 0.4192, 0.3900]), torch.tensor([0.2918, 0.2796, 0.2709]))
@@ -152,23 +159,30 @@ class MultiInputModel(nn.Module):
         self.image_model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
         num_features = self.image_model.classifier[1].in_features
         self.image_model.classifier[1] = nn.Identity()
-        for param in self.image_model.parameters():
-            param.requires_grad = True
+        # Adding additional convolutional and pooling layers to image model
+        self.conv1 = nn.Conv2d(in_channels=num_features, out_channels=512, kernel_size=3, stride=1, padding=1)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        self.conv2 = nn.Conv2d(in_channels=512, out_channels=256, kernel_size=3, stride=1, padding=1)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
         # Text model
         self.text_model = DistilBertModel.from_pretrained('distilbert-base-uncased')
-        self.text_fc = nn.Linear(self.text_model.config.hidden_size, 512)
-        for param in self.text_model.parameters():
-            param.requires_grad = True 
+        self.text_fc = nn.Linear(self.text_model.config.hidden_size, 768)
         # Combining both image and text features
-        self.fc1 = nn.Linear(num_features + 512, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, 64) 
-        self.fc4 = nn.Linear(64, num_classes)
+        self.fc1 = nn.Linear(1024, 256)
+        self.fc2 = nn.Linear(256, 64)
+        self.fc3 = nn.Linear(64, 16) 
+        self.fc4 = nn.Linear(16, num_classes)
         self.dropout = nn.Dropout(0.3)
-        
+        # Set requires_grad = True for all parameters in MobileNetV2 and DistilBERT to fine-tune them
+        for param in self.image_model.parameters():
+            param.requires_grad = True  # Allow training of image model
+        for param in self.text_model.parameters():
+            param.requires_grad = True  # Allow training of text model
     def forward(self, image, input_ids, attention_mask):
         # Image features
         image_features = self.image_model.features(image)
+        image_features = self.pool1(F.relu(self.conv1(image_features)))
+        image_features = self.pool2(F.relu(self.conv2(image_features)))
         image_features = image_features.mean([2, 3])  # Global Average Pooling
         # Text features
         text_features = self.text_model(input_ids=input_ids, attention_mask=attention_mask)[0]
@@ -218,6 +232,32 @@ class MultiModalDataset(Dataset):
             'attention_mask': encoding['attention_mask'].flatten(),
             'label': torch.tensor(label, dtype=torch.long)
         }
+
+def predictALL(model, dataloader, device, class_names):
+    correct_pred = {classname: 0 for classname in class_names}
+    total_pred = {classname: 0 for classname in class_names}
+    model.eval()
+    showFirstTenMissClassed = 10
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch['image'].to(device)
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+            outputs = model(images, input_ids, attention_mask)
+            _, preds = torch.max(outputs, dim=1)
+            for label, prediction, image in zip(labels, preds, images):
+                if label == prediction:
+                    correct_pred[class_names[label]] += 1
+                if label != prediction:
+                    if showFirstTenMissClassed >= 0:
+                        print(f"This is classed as: {class_names[label]}\nThe model predicted class: {class_names[prediction]}")
+                        imshow(image, stats)
+                        showFirstTenMissClassed -= 1
+                total_pred[class_names[label]] += 1
+    for classname, correct_count in correct_pred.items():
+        accuracy = 100 * float(correct_count) / total_pred[classname]
+        print(f'Accuracy for class: {classname:5s} is {accuracy:.1f} %')
         
 transform = {
     "train": transforms.Compose([
@@ -277,25 +317,33 @@ model = MultiInputModel(num_classes=len(class_names)).to(device)
 # Training parameters
 optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
 criterion = nn.CrossEntropyLoss()
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+
+# scheduler = ExponentialLR(optimizer, gamma=0.9)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=1)
 
 # Training loop
 for epoch in range(num_epochs):
+    print(f"Time =", datetime.now().strftime(f"%H:%M:%S"))
     train_loss = train(model, dataloaders['train'], optimizer, criterion, device)
     print(f'Epoch: {epoch+1}, Train Loss: {train_loss:.4f}')
     val_loss, val_accuracy = evaluate(model, dataloaders['val'], criterion, device)
     print(f'Epoch {epoch + 1}/{num_epochs}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}')
+    if val_loss >= best_loss*1.25:
+        print(f"\nValidation error grew by 25%, so stopped training.")
+        break
     if val_loss < best_loss:
         best_loss = val_loss
-        torch.save(model.state_dict(), 'best_model.pth')
-        print("The model has been saved.")
+        torch.save(model.state_dict(), f'best_model.pth')
+        print(f"\nThe model has been saved!\n")
     scheduler.step()
-    # print(f'Learning Rate: {scheduler.get_last_lr()[0]:.8f}')
+    print(f'New Learning Rate: {scheduler.get_last_lr()[0]:.3e}')
     
 model.load_state_dict(torch.load('best_model.pth'))
 # Evaluation
 test_predictions = np.array(predict(model, dataloaders['test'], device))
 print(f"Accuracy: {(test_predictions == labels_test).sum()/len(labels_test):.4f}")
+
+predictALL(model, dataloaders['test'], device, class_names)
 
 cm = confusion_matrix(labels_test, test_predictions)
 
