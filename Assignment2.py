@@ -7,15 +7,6 @@ from torchvision.models import resnet18, mobilenet_v2, MobileNet_V2_Weights
 from transformers import DistilBertModel, DistilBertTokenizer, AdamW, AutoProcessor, get_scheduler, AutoModelForCausalLM, AutoTokenizer
 from torch.utils.data import DataLoader, Dataset 
 
-import sys
-sys.path.append('/home/poz/Notebooks/645_Assignment2')
-# from myDefsnClasses import imshow, DistilBERTClassifier, read_text_files_with_labels, train, evaluate, predict, MultiInputModel, MultiModalDataset, fullTrain
-
-# import multiprocessing
-# if __name__ == "__main__":
-#     multiprocessing.set_start_method("fork")
-#     torch.multiprocessing.set_sharing_strategy('file_system')
-
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -39,6 +30,7 @@ os.environ['TF_ENABLE_ONEDNN_OPTS'] = "0"
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
 print('CUDA available', torch.cuda.is_available())
 print('CUDA version', torch.version.cuda)
 print('cuDNN enabled', torch.backends.cudnn.enabled)
@@ -53,8 +45,8 @@ for i in range(n_cuda_devices):
 batch_size = 32
 image_resize = 224
 num_workers = 8
-num_epochs = 6
-max_len = 48
+num_epochs = 10
+max_len = 24
 best_loss = 1e+10
 learning_rate = 2e-5
 stats = (torch.tensor([0.4482, 0.4192, 0.3900]), torch.tensor([0.2918, 0.2796, 0.2709]))
@@ -135,7 +127,7 @@ def evaluate(model, dataloader, criterion, device):
             _, preds = torch.max(output, 1)
             correct += torch.sum(preds == labels).item()
             total += labels.size(0)
-    accuracy = correct / total
+    accuracy = 100*correct / total
     return total_loss / len(dataloader), accuracy
 
 def predict(model, dataloader, device):
@@ -170,9 +162,9 @@ class MultiInputModel(nn.Module):
         # Combining both image and text features
         self.fc1 = nn.Linear(1024, 256)
         self.fc2 = nn.Linear(256, 64)
-        self.fc3 = nn.Linear(64, 16) 
+        self.fc3 = nn.Linear(64, 16)
         self.fc4 = nn.Linear(16, num_classes)
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(0.1)
         # Set requires_grad = True for all parameters in MobileNetV2 and DistilBERT to fine-tune them
         for param in self.image_model.parameters():
             param.requires_grad = True  # Allow training of image model
@@ -237,7 +229,7 @@ def predictALL(model, dataloader, device, class_names):
     correct_pred = {classname: 0 for classname in class_names}
     total_pred = {classname: 0 for classname in class_names}
     model.eval()
-    showFirstTenMissClassed = 10
+    showFirstTenMissClassed = -1
     with torch.no_grad():
         for batch in dataloader:
             images = batch['image'].to(device)
@@ -255,10 +247,13 @@ def predictALL(model, dataloader, device, class_names):
                         imshow(image, stats)
                         showFirstTenMissClassed -= 1
                 total_pred[class_names[label]] += 1
+    test_accuracy = 100-(100*(sum(total_pred.values())-sum(correct_pred.values()))/sum(total_pred.values()))
+    print(f'Test accuracy for all classes: {test_accuracy:.2f}%')
     for classname, correct_count in correct_pred.items():
         accuracy = 100 * float(correct_count) / total_pred[classname]
-        print(f'Accuracy for class: {classname:5s} is {accuracy:.1f} %')
-        
+        print(f'Accuracy for class: {classname:5s} is {accuracy:.2f}%')
+    return test_accuracy
+    
 transform = {
     "train": transforms.Compose([
         transforms.Resize((232, 232), interpolation=InterpolationMode.BILINEAR),
@@ -315,42 +310,44 @@ print("Test set:", len(dataloaders['test'])*batch_size)
 model = MultiInputModel(num_classes=len(class_names)).to(device)
 
 # Training parameters
-optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-10)
 criterion = nn.CrossEntropyLoss()
-
-# scheduler = ExponentialLR(optimizer, gamma=0.9)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=1)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=1)
 
 # Training loop
+best_val_accuracy = 0
+best_test_accuracy = 0
 for epoch in range(num_epochs):
-    print(f"Time =", datetime.now().strftime(f"%H:%M:%S"))
+    print(f"\nStarted Training Loop =", datetime.now().strftime(f"%H:%M:%S"))
     train_loss = train(model, dataloaders['train'], optimizer, criterion, device)
-    print(f'Epoch: {epoch+1}, Train Loss: {train_loss:.4f}')
+    print(f'Epoch: {epoch+1}, Train Loss: {train_loss:.4f}\n')
+    print(f"Started Validaiton Loop =", datetime.now().strftime(f"%H:%M:%S"))
     val_loss, val_accuracy = evaluate(model, dataloaders['val'], criterion, device)
-    print(f'Epoch {epoch + 1}/{num_epochs}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}')
-    if val_loss >= best_loss*1.25:
-        print(f"\nValidation error grew by 25%, so stopped training.")
+    print(f'Epoch {epoch + 1}/{num_epochs}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%')
+    print(f"\nStarted Calculating Test Accuracy =", datetime.now().strftime(f"%H:%M:%S"))
+    test_accuracy = predictALL(model, dataloaders['test'], device, class_names)
+    if val_loss >= best_loss*1.25 or val_accuracy <= best_val_accuracy*0.97 or test_accuracy <= best_test_accuracy*0.97 :
+        print(f"\nValidation error grew by 25% ,or validation accuracy dropped by 3%, or test accuracy dropped by 3%, so stopped training.")
         break
-    if val_loss < best_loss:
+    if val_loss <= best_loss or best_val_accuracy <= val_accuracy:
         best_loss = val_loss
+        best_val_accuracy = val_accuracy
+    if best_test_accuracy <= test_accuracy:
+        best_test_accuracy = test_accuracy
         torch.save(model.state_dict(), f'best_model.pth')
-        print(f"\nThe model has been saved!\n")
+        print(f"\nThe model has been saved!")
     scheduler.step()
-    print(f'New Learning Rate: {scheduler.get_last_lr()[0]:.3e}')
     
 model.load_state_dict(torch.load('best_model.pth'))
 # Evaluation
 test_predictions = np.array(predict(model, dataloaders['test'], device))
 print(f"Accuracy: {(test_predictions == labels_test).sum()/len(labels_test):.4f}")
 
-predictALL(model, dataloaders['test'], device, class_names)
-
 cm = confusion_matrix(labels_test, test_predictions)
 
 # Plot confusion matrix
 plt.figure(figsize=(8, 6))
 sns.heatmap(cm, annot=True, cmap='Blues', fmt='g', cbar=False)
-
 plt.title('Confusion Matrix')
 plt.xlabel('Predicted Labels')
 plt.ylabel('True Labels')
