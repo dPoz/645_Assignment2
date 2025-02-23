@@ -45,13 +45,13 @@ for i in range(n_cuda_devices):
 batch_size = 32
 image_resize = 224
 num_workers = 8
-num_epochs = 10
+num_epochs = 20
 max_len = 24
-best_loss = 1e+10
+best_loss = float('inf')
 learning_rate = 2e-5
 stats = (torch.tensor([0.4482, 0.4192, 0.3900]), torch.tensor([0.2918, 0.2796, 0.2709]))
 
-# Modify the imshow function to ensure stats are on the same device as the image
+### Modify the imshow function to ensure stats are on the same device as the image
 def imshow(img, stats):
     mean = stats[0].view(3, 1, 1).to(img.device)
     std = stats[1].view(3, 1, 1).to(img.device)
@@ -59,18 +59,6 @@ def imshow(img, stats):
     npimg = img.cpu().numpy()
     plt.imshow(np.transpose(npimg, (1, 2, 0)))
     plt.show()
-
-# Define the text model
-class DistilBERTClassifier(nn.Module):
-    def __init__(self, num_classes):
-        super(DistilBERTClassifier, self).__init__()
-        self.distilbert = DistilBertModel.from_pretrained('distilbert-base-uncased')
-        self.drop = nn.Dropout(0.3)
-        self.out = nn.Linear(self.distilbert.config.hidden_size, num_classes)
-    def forward(self, input_ids, attention_mask):
-        pooled_output = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)[0]
-        output = self.drop(pooled_output[:,0])
-        return self.out(output)
 
 # Extract text from file names as well as labels
 def read_text_files_with_labels(path):
@@ -92,11 +80,41 @@ def read_text_files_with_labels(path):
                     labels.append(label_map[class_name])
     return np.array(texts), np.array(labels)
 
+class MultiModalDataset(Dataset):
+    def __init__(self, image_dataset, texts, labels, tokenizer, max_len):
+        self.image_dataset = image_dataset
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+    def __len__(self):
+        return len(self.image_dataset)
+    def __getitem__(self, idx):
+        image, label = self.image_dataset[idx]
+        label = self.labels[idx]
+        text = str(self.texts[idx])
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+        return {
+            'image': image,
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'label': torch.tensor(label, dtype=torch.long)
+        }
+        
 # Define training function
 def train(model, dataloader, optimizer, criterion, device):
     model.train()
     total_loss = 0
-    for batch in dataloader:
+    for batch in tqdm(dataloader, desc="Training"):
         images = batch['image'].to(device)
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
@@ -108,15 +126,15 @@ def train(model, dataloader, optimizer, criterion, device):
         optimizer.step()
         total_loss += loss.item()
     return total_loss / len(dataloader)
-
+    
 # Define evaluation function
 def evaluate(model, dataloader, criterion, device):
     model.eval()
     total_loss = 0
-    correct = 0
-    total = 0
+    total_correct = 0
+    total_samples = 0
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc="Validating"):
             images = batch['image'].to(device)
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
@@ -125,16 +143,16 @@ def evaluate(model, dataloader, criterion, device):
             loss = criterion(output, labels)
             total_loss += loss.item()
             _, preds = torch.max(output, 1)
-            correct += torch.sum(preds == labels).item()
-            total += labels.size(0)
-    accuracy = 100*correct / total
+            total_correct += torch.sum(preds == labels).item()
+            total_samples += labels.size(0)
+    accuracy = 100*total_correct / total_samples
     return total_loss / len(dataloader), accuracy
 
 def predict(model, dataloader, device):
     model.eval()  # Set the model to evaluation mode
     predictions = []
     with torch.no_grad():  # Disable gradient tracking
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc="Evaluating"):
             images = batch['image'].to(device)
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
@@ -144,9 +162,38 @@ def predict(model, dataloader, device):
             predictions.extend(preds.cpu().numpy())
     return predictions
 
+def predictALL(model, dataloader, device, class_names):
+    correct_pred = {classname: 0 for classname in class_names}
+    total_pred = {classname: 0 for classname in class_names}
+    model.eval()
+    showFirstTenMissClassed = -1
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating Test"):
+            images = batch['image'].to(device)
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+            outputs = model(images, input_ids, attention_mask)
+            _, preds = torch.max(outputs, dim=1)
+            for label, prediction, image in zip(labels, preds, images):
+                if label == prediction:
+                    correct_pred[class_names[label]] += 1
+                if label != prediction:
+                    if showFirstTenMissClassed >= 0:
+                        print(f"This is classed as: {class_names[label]}\nThe model predicted class: {class_names[prediction]}")
+                        imshow(image, stats)
+                        showFirstTenMissClassed -= 1
+                total_pred[class_names[label]] += 1
+    test_accuracy = 100-(100*(sum(total_pred.values())-sum(correct_pred.values()))/sum(total_pred.values()))
+    print(f'Test accuracy for all classes: {test_accuracy:.2f}%')
+    for classname, correct_count in correct_pred.items():
+        accuracy = 100 * float(correct_count) / total_pred[classname]
+        print(f'Accuracy for class: {classname:5s} is {accuracy:.2f}%')
+    return test_accuracy
+    
 class MultiInputModel(nn.Module):
     def __init__(self, num_classes):
-        super(MultiInputModel, self).__init__()
+        super(MultiInputModel_2, self).__init__()
         # Image model
         self.image_model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
         num_features = self.image_model.classifier[1].in_features
@@ -183,77 +230,18 @@ class MultiInputModel(nn.Module):
         # Combine image and text features
         combined_features = torch.cat((image_features, text_features), dim=1)
         # Classifier with Activation functions, and Dropout
-        x = self.fc1(combined_features)
-        x = F.relu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        x = F.relu(x)
-        x = self.dropout(x)
-        x = self.fc3(x)
-        x = F.relu(x)
-        x = self.dropout(x)
-        x = self.fc4(x)
-        return x
-
-class MultiModalDataset(Dataset):
-    def __init__(self, image_dataset, texts, labels, tokenizer, max_len):
-        self.image_dataset = image_dataset
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-    def __len__(self):
-        return len(self.image_dataset)
-    def __getitem__(self, idx):
-        image, label = self.image_dataset[idx]
-        label = self.labels[idx]
-        text = str(self.texts[idx])
-        encoding = self.tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=self.max_len,
-            return_token_type_ids=False,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt'
-        )
-        return {
-            'image': image,
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'label': torch.tensor(label, dtype=torch.long)
-        }
-
-def predictALL(model, dataloader, device, class_names):
-    correct_pred = {classname: 0 for classname in class_names}
-    total_pred = {classname: 0 for classname in class_names}
-    model.eval()
-    showFirstTenMissClassed = -1
-    with torch.no_grad():
-        for batch in dataloader:
-            images = batch['image'].to(device)
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['label'].to(device)
-            outputs = model(images, input_ids, attention_mask)
-            _, preds = torch.max(outputs, dim=1)
-            for label, prediction, image in zip(labels, preds, images):
-                if label == prediction:
-                    correct_pred[class_names[label]] += 1
-                if label != prediction:
-                    if showFirstTenMissClassed >= 0:
-                        print(f"This is classed as: {class_names[label]}\nThe model predicted class: {class_names[prediction]}")
-                        imshow(image, stats)
-                        showFirstTenMissClassed -= 1
-                total_pred[class_names[label]] += 1
-    test_accuracy = 100-(100*(sum(total_pred.values())-sum(correct_pred.values()))/sum(total_pred.values()))
-    print(f'Test accuracy for all classes: {test_accuracy:.2f}%')
-    for classname, correct_count in correct_pred.items():
-        accuracy = 100 * float(correct_count) / total_pred[classname]
-        print(f'Accuracy for class: {classname:5s} is {accuracy:.2f}%')
-    return test_accuracy
-    
+        combined_features = self.fc1(combined_features)
+        combined_features = F.relu(combined_features)
+        combined_features = self.dropout(combined_features)
+        combined_features = self.fc2(combined_features)
+        combined_features = F.relu(combined_features)
+        combined_features = self.dropout(combined_features)
+        combined_features = self.fc3(combined_features)
+        combined_features = F.relu(combined_features)
+        combined_features = self.dropout(combined_features)
+        combined_features = self.fc4(combined_features)
+        return combined_features
+        
 transform = {
     "train": transforms.Compose([
         transforms.Resize((232, 232), interpolation=InterpolationMode.BILINEAR),
@@ -291,7 +279,6 @@ datasets = {"train": ds.ImageFolder(train_dir, transform=transform["train"]),
             "test": ds.ImageFolder(test_dir, transform=transform["test"])}
 
 class_names = datasets['train'].classes
-print(class_names)
 
 tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
 
@@ -303,16 +290,12 @@ dataloaders = {"train": DataLoader(datasets["train"], batch_size=batch_size, shu
                "val": DataLoader(datasets["val"], batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True),
                "test": DataLoader(datasets["test"], batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)}
 
-print("Train set:", len(dataloaders['train'])*batch_size)
-print("Val set:", len(dataloaders['val'])*batch_size)
-print("Test set:", len(dataloaders['test'])*batch_size)
-
 model = MultiInputModel(num_classes=len(class_names)).to(device)
 
 # Training parameters
 optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-10)
 criterion = nn.CrossEntropyLoss()
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=1)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=1)
 
 # Training loop
 best_val_accuracy = 0
@@ -326,8 +309,8 @@ for epoch in range(num_epochs):
     print(f'Epoch {epoch + 1}/{num_epochs}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%')
     print(f"\nStarted Calculating Test Accuracy =", datetime.now().strftime(f"%H:%M:%S"))
     test_accuracy = predictALL(model, dataloaders['test'], device, class_names)
-    if val_loss >= best_loss*1.25 or val_accuracy <= best_val_accuracy*0.97 or test_accuracy <= best_test_accuracy*0.97 :
-        print(f"\nValidation error grew by 25% ,or validation accuracy dropped by 3%, or test accuracy dropped by 3%, so stopped training.")
+    if val_loss >= best_loss*1.5 or val_accuracy <= best_val_accuracy*0.95 or test_accuracy <= best_test_accuracy*0.95 :
+        print(f"\nValidation error grew by 50%, or validation accuracy dropped by 5%, or test accuracy dropped by 5%, so stopped training.")
         break
     if val_loss <= best_loss or best_val_accuracy <= val_accuracy:
         best_loss = val_loss
@@ -342,6 +325,8 @@ model.load_state_dict(torch.load('best_model.pth'))
 # Evaluation
 test_predictions = np.array(predict(model, dataloaders['test'], device))
 print(f"Accuracy: {(test_predictions == labels_test).sum()/len(labels_test):.4f}")
+
+test_accuracy = predictALL(model, dataloaders['test'], device, class_names)
 
 cm = confusion_matrix(labels_test, test_predictions)
 
