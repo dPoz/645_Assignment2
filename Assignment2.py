@@ -193,7 +193,7 @@ def predictALL(model, dataloader, device, class_names):
     
 class MultiInputModel(nn.Module):
     def __init__(self, num_classes):
-        super(MultiInputModel_2, self).__init__()
+        super(MultiInputModel, self).__init__()
         # Image model
         self.image_model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
         num_features = self.image_model.classifier[1].in_features
