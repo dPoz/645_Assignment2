@@ -44,7 +44,7 @@ for i in range(n_cuda_devices):
 
 batch_size = 32
 image_resize = 224
-num_workers = 8
+num_workers = 16
 num_epochs = 20
 max_len = 24
 best_loss = float('inf')
@@ -297,6 +297,9 @@ optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-10)
 criterion = nn.CrossEntropyLoss()
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=1)
 
+# Model path
+best_model_path = os.path.join(os.getcwd(), 'best_model.pth')
+
 # Training loop
 best_val_accuracy = 0
 best_test_accuracy = 0
@@ -317,11 +320,11 @@ for epoch in range(num_epochs):
         best_val_accuracy = val_accuracy
     if best_test_accuracy <= test_accuracy:
         best_test_accuracy = test_accuracy
-        torch.save(model.state_dict(), f'best_model.pth')
+        torch.save(model.state_dict(), best_model_path)
         print(f"\nThe model has been saved!")
     scheduler.step()
     
-model.load_state_dict(torch.load('best_model.pth'))
+model.load_state_dict(torch.load(best_model_path))
 # Evaluation
 test_predictions = np.array(predict(model, dataloaders['test'], device))
 print(f"Accuracy: {(test_predictions == labels_test).sum()/len(labels_test):.4f}")
