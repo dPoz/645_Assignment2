@@ -265,7 +265,7 @@ transform = {
     ]),
 }
 
-data_dir = r"/home/poz/garbage_data"
+data_dir = r"/work/TALC/enel645_2025w/garbage_data/"
 train_dir = os.path.join(data_dir, "CVPR_2024_dataset_Train")
 val_dir = os.path.join(data_dir, "CVPR_2024_dataset_Val")
 test_dir = os.path.join(data_dir, "CVPR_2024_dataset_Test")
