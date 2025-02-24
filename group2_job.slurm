@@ -16,6 +16,7 @@ source ~/software/init-conda
 # Activate your environment
 conda activate pytorch
 
+# Execute the python script
 python $SLURM_SUBMIT_DIR/Assignment2.py
 
 # Deactivate your environment
