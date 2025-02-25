@@ -51,6 +51,9 @@ best_loss = float('inf')
 learning_rate = 2e-5
 stats = (torch.tensor([0.4482, 0.4192, 0.3900]), torch.tensor([0.2918, 0.2796, 0.2709]))
 
+# Model path
+best_model_path = os.path.join(os.getcwd(), 'best_model.pth')
+
 ### Modify the imshow function to ensure stats are on the same device as the image
 def imshow(img, stats):
     mean = stats[0].view(3, 1, 1).to(img.device)
@@ -190,7 +193,32 @@ def predictALL(model, dataloader, device, class_names):
         accuracy = 100 * float(correct_count) / total_pred[classname]
         print(f'Accuracy for class: {classname:5s} is {accuracy:.2f}%')
     return test_accuracy
-    
+
+def epochLoop(model, dataloaders, optimizer, criterion, device, class_names, num_epochs):
+    best_loss = float('inf')
+    best_val_accuracy = 0
+    for epoch in range(num_epochs):
+        print(f"\nStarted Training Loop =", datetime.now().strftime(f"%H:%M:%S"))
+        train_loss = train(model, dataloaders['train'], optimizer, criterion, device)
+        print(f"Started Validaiton Loop =", datetime.now().strftime(f"%H:%M:%S"))
+        val_loss, val_accuracy = evaluate(model, dataloaders['val'], criterion, device)
+        print(f'\nEpoch {epoch + 1}/{num_epochs}')
+        print(f'Train Loss: {train_loss:.4f}')
+        print(f'Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%\n')
+        if val_loss >= best_loss*1.5 or val_accuracy <= best_val_accuracy*0.96:
+            print(f"Validation error grew by 50%, or validation accuracy dropped by 4%, so stopped training.")
+            break
+        if val_loss <= best_loss or best_val_accuracy <= val_accuracy:
+            torch.save(model.state_dict(), best_model_path)
+            print(f"The model has been saved!")
+            if val_loss <= best_loss:
+                best_loss = val_loss
+                print(f"Due to lowest validation loss.")
+            if best_val_accuracy <= val_accuracy:
+                best_val_accuracy = val_accuracy
+                print(f"Due to highest validation accuracy.")
+        scheduler.step()
+
 class MultiInputModel(nn.Module):
     def __init__(self, num_classes):
         super(MultiInputModel, self).__init__()
@@ -199,24 +227,25 @@ class MultiInputModel(nn.Module):
         num_features = self.image_model.classifier[1].in_features
         self.image_model.classifier[1] = nn.Identity()
         # Adding additional convolutional and pooling layers to image model
-        self.conv1 = nn.Conv2d(in_channels=num_features, out_channels=512, kernel_size=3, stride=1, padding=1)
+        self.conv1 = nn.Conv2d(in_channels=num_features, out_channels=1024, kernel_size=3, stride=1, padding=1)
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
-        self.conv2 = nn.Conv2d(in_channels=512, out_channels=256, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, stride=1, padding=1)
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
         # Text model
         self.text_model = DistilBertModel.from_pretrained('distilbert-base-uncased')
         self.text_fc = nn.Linear(self.text_model.config.hidden_size, 768)
         # Combining both image and text features
-        self.fc1 = nn.Linear(1024, 256)
-        self.fc2 = nn.Linear(256, 64)
-        self.fc3 = nn.Linear(64, 16)
+        self.fc1 = nn.Linear(1280, 512)
+        self.fc2 = nn.Linear(512, 128)
+        self.fc3 = nn.Linear(128, 16)
         self.fc4 = nn.Linear(16, num_classes)
         self.dropout = nn.Dropout(0.1)
+        self.batch_norm1 = nn.BatchNorm1d(512)
         # Set requires_grad = True for all parameters in MobileNetV2 and DistilBERT to fine-tune them
         for param in self.image_model.parameters():
-            param.requires_grad = True  # Allow training of image model
+            param.requires_grad = True
         for param in self.text_model.parameters():
-            param.requires_grad = True  # Allow training of text model
+            param.requires_grad = True
     def forward(self, image, input_ids, attention_mask):
         # Image features
         image_features = self.image_model.features(image)
@@ -233,6 +262,7 @@ class MultiInputModel(nn.Module):
         combined_features = self.fc1(combined_features)
         combined_features = F.relu(combined_features)
         combined_features = self.dropout(combined_features)
+        combined_features = self.batch_norm1(combined_features)
         combined_features = self.fc2(combined_features)
         combined_features = F.relu(combined_features)
         combined_features = self.dropout(combined_features)
@@ -297,35 +327,11 @@ optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-10)
 criterion = nn.CrossEntropyLoss()
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=1)
 
-# Model path
-best_model_path = os.path.join(os.getcwd(), 'best_model.pth')
-
-# Training loop
-best_val_accuracy = 0
-best_test_accuracy = 0
-for epoch in range(num_epochs):
-    print(f"\nStarted Training Loop =", datetime.now().strftime(f"%H:%M:%S"))
-    train_loss = train(model, dataloaders['train'], optimizer, criterion, device)
-    print(f'Epoch: {epoch+1}, Train Loss: {train_loss:.4f}\n')
-    print(f"Started Validaiton Loop =", datetime.now().strftime(f"%H:%M:%S"))
-    val_loss, val_accuracy = evaluate(model, dataloaders['val'], criterion, device)
-    print(f'Epoch {epoch + 1}/{num_epochs}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.2f}%')
-    print(f"\nStarted Calculating Test Accuracy =", datetime.now().strftime(f"%H:%M:%S"))
-    test_accuracy = predictALL(model, dataloaders['test'], device, class_names)
-    if val_loss >= best_loss*1.5 or val_accuracy <= best_val_accuracy*0.95 or test_accuracy <= best_test_accuracy*0.95 :
-        print(f"\nValidation error grew by 50%, or validation accuracy dropped by 5%, or test accuracy dropped by 5%, so stopped training.")
-        break
-    if val_loss <= best_loss or best_val_accuracy <= val_accuracy:
-        best_loss = val_loss
-        best_val_accuracy = val_accuracy
-    if best_test_accuracy <= test_accuracy:
-        best_test_accuracy = test_accuracy
-        torch.save(model.state_dict(), best_model_path)
-        print(f"\nThe model has been saved!")
-    scheduler.step()
+# start epoch loop to train and validate the model
+epochLoop(model, dataloaders, optimizer, criterion, device, class_names, num_epochs)
     
 model.load_state_dict(torch.load(best_model_path))
-# Evaluation
+# Evaluation test
 test_predictions = np.array(predict(model, dataloaders['test'], device))
 print(f"Accuracy: {(test_predictions == labels_test).sum()/len(labels_test):.4f}")
 
